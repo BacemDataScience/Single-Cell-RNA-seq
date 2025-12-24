@@ -1,0 +1,430 @@
+---
+title: "GSE211644 PDAC TIL scRNA-seq (fresh vs grown) — Full QC + Clusters + Top Genes + Figures"
+author: "Bacem Saada"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r ONE_BIG_CHUNK_FULL_PIPELINE, echo=TRUE, message=FALSE, warning=FALSE}
+############################################################
+# GSE211644 — ONE BIG CHUNK, MANY ANALYSES + BEAUTIFUL FIGURES
+# Author: Bacem Saada
+#
+# DATA FOLDER (your exact):
+#   D:/scRNAseq/GSE211644/
+#
+# REQUIRED FILES (8):
+#   GSE211644_fresh_barcodes.tsv.gz
+#   GSE211644_fresh_genes.tsv.gz
+#   GSE211644_fresh_matrix.mtx.gz
+#   GSE211644_fresh_metadata.csv.gz
+#   GSE211644_grown_barcodes.tsv.gz
+#   GSE211644_grown_genes.tsv.gz
+#   GSE211644_grown_matrix.mtx.gz
+#   GSE211644_grown_metadata.csv.gz
+#
+# OUTPUTS (saved into same folder):
+#   - GSE211644_combined_seurat.rds
+#   - GSE211644_metadata_allcells.csv
+#   - GSE211644_cluster_markers.csv
+#   - GSE211644_cluster_top10_markers.csv
+#   - GSE211644_DE_grown_vs_fresh.csv
+#   - GSE211644_DE_high_vs_low_exhaustion.csv
+#   - Multiple PNG figures in /figures
+#
+# WHAT YOU GET:
+#   - QC plots (violin, scatter)
+#   - Integration (SCT)
+#   - UMAPs (condition, clusters, split)
+#   - Cluster composition barplots
+#   - Top marker genes per cluster (tables + heatmap + dotplot)
+#   - T-cell state scoring (exhaustion/cytotoxicity/proliferation) + violins + ridges
+#   - DE (grown vs fresh) + (high vs low exhaustion) + volcano plots
+############################################################
+
+########################
+# 0) Install + load packages
+########################
+pkgs <- c(
+  "Seurat","Matrix","data.table","dplyr","ggplot2","patchwork",
+  "scales"
+)
+to_install <- pkgs[!sapply(pkgs, requireNamespace, quietly=TRUE)]
+if(length(to_install)>0) install.packages(to_install, repos="https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only=TRUE))
+
+# Optional for ridge plots (nice)
+if(!requireNamespace("ggridges", quietly=TRUE)) install.packages("ggridges", repos="https://cloud.r-project.org")
+library(ggridges)
+
+set.seed(1234)
+
+########################
+# 1) Paths + figure folder
+########################
+DATA_DIR <- "D:/scRNAseq/GSE211644"
+FIG_DIR  <- file.path(DATA_DIR, "figures")
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+fresh_mtx  <- file.path(DATA_DIR,"GSE211644_fresh_matrix.mtx.gz")
+fresh_gene <- file.path(DATA_DIR,"GSE211644_fresh_genes.tsv.gz")
+fresh_bc   <- file.path(DATA_DIR,"GSE211644_fresh_barcodes.tsv.gz")
+fresh_meta <- file.path(DATA_DIR,"GSE211644_fresh_metadata.csv.gz")
+
+grown_mtx  <- file.path(DATA_DIR,"GSE211644_grown_matrix.mtx.gz")
+grown_gene <- file.path(DATA_DIR,"GSE211644_grown_genes.tsv.gz")
+grown_bc   <- file.path(DATA_DIR,"GSE211644_grown_barcodes.tsv.gz")
+grown_meta <- file.path(DATA_DIR,"GSE211644_grown_metadata.csv.gz")
+
+stopifnot(file.exists(fresh_mtx), file.exists(fresh_gene), file.exists(fresh_bc), file.exists(fresh_meta))
+stopifnot(file.exists(grown_mtx), file.exists(grown_gene), file.exists(grown_bc), file.exists(grown_meta))
+
+cat("Files detected:\n"); print(list.files(DATA_DIR))
+
+########################
+# 2) Plot theme helper (clean, publication-ish)
+########################
+theme_pub <- function(){
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face="bold", size=13),
+      axis.title = element_text(face="bold"),
+      panel.grid.minor = element_blank(),
+      legend.title = element_text(face="bold")
+    )
+}
+
+ggsave2 <- function(filename, plot, w=9, h=6, dpi=300){
+  ggsave(file.path(FIG_DIR, filename), plot = plot, width = w, height = h, dpi = dpi)
+}
+
+########################
+# 3) Read MTX bundles + attach metadata (auto barcode col detection)
+########################
+read_bundle <- function(mtx, genes, barcodes, meta, label){
+  mat <- Matrix::readMM(gzfile(mtx))
+  mat <- as(mat, "dgCMatrix")
+
+  g <- data.table::fread(cmd = paste("zcat", shQuote(genes)), header=FALSE, data.table=FALSE)
+  bc <- data.table::fread(cmd = paste("zcat", shQuote(barcodes)), header=FALSE, data.table=FALSE)[[1]]
+
+  gene_names <- if(ncol(g) >= 2) g[[2]] else g[[1]]
+  gene_names <- make.unique(as.character(gene_names))
+
+  stopifnot(nrow(mat) == length(gene_names))
+  stopifnot(ncol(mat) == length(bc))
+
+  rownames(mat) <- gene_names
+  colnames(mat) <- paste0(label, "_", as.character(bc))
+
+  so <- Seurat::CreateSeuratObject(mat, project=label, min.cells=3, min.features=200)
+  so$condition <- label
+  so[["percent.mt"]] <- PercentageFeatureSet(so, pattern="^MT-")
+
+  md <- data.table::fread(cmd = paste("zcat", shQuote(meta)), data.table=FALSE)
+
+  # Detect barcode column
+  bc_candidates <- c("barcode","barcodes","cell","cell_id","cellid","cb","cell_barcode")
+  bc_col <- colnames(md)[tolower(colnames(md)) %in% bc_candidates]
+  if(length(bc_col)==0){
+    cat("\nWARNING: No barcode-like column detected for", label, "\nMetadata columns:\n")
+    print(colnames(md))
+    cat("Proceeding WITHOUT metadata merge for", label, "\n\n")
+    return(so)
+  }
+  bc_col <- bc_col[1]
+  md[[bc_col]] <- paste0(label, "_", as.character(md[[bc_col]]))
+
+  # Align to Seurat cells
+  md2 <- md[match(colnames(so), md[[bc_col]]), , drop=FALSE]
+  n_miss <- sum(is.na(md2[[bc_col]]))
+  if(n_miss > 0){
+    cat("\nWARNING:", n_miss, "cells did not match metadata for", label, "\n")
+    cat("If this is large, paste: colnames(metadata) + head(barcodes) and I’ll fix matching.\n\n")
+  } else {
+    cat("Metadata matched for", label, "OK.\n")
+  }
+  rownames(md2) <- md2[[bc_col]]
+  so <- AddMetaData(so, md2)
+
+  so
+}
+
+fresh <- read_bundle(fresh_mtx,fresh_gene,fresh_bc,fresh_meta,"fresh")
+grown <- read_bundle(grown_mtx,grown_gene,grown_bc,grown_meta,"grown")
+
+cat("\nObject summaries:\n")
+print(fresh); print(grown)
+
+########################
+# 4) QC: violin + scatter + filtering
+########################
+p_qc1 <- VlnPlot(fresh, features=c("nFeature_RNA","nCount_RNA","percent.mt"), ncol=3) +
+  plot_annotation(title="QC (Fresh)") & theme_pub()
+p_qc2 <- VlnPlot(grown, features=c("nFeature_RNA","nCount_RNA","percent.mt"), ncol=3) +
+  plot_annotation(title="QC (Grown)") & theme_pub()
+
+print(p_qc1); print(p_qc2)
+ggsave2("QC_violin_fresh.png", p_qc1, w=12, h=4)
+ggsave2("QC_violin_grown.png", p_qc2, w=12, h=4)
+
+# Scatter QC
+p_sc_f <- FeatureScatter(fresh, feature1="nCount_RNA", feature2="percent.mt") + theme_pub() + ggtitle("Fresh: nCount vs %MT")
+p_sc_g <- FeatureScatter(grown, feature1="nCount_RNA", feature2="percent.mt") + theme_pub() + ggtitle("Grown: nCount vs %MT")
+print(p_sc_f); print(p_sc_g)
+ggsave2("QC_scatter_fresh.png", p_sc_f, w=7, h=5)
+ggsave2("QC_scatter_grown.png", p_sc_g, w=7, h=5)
+
+# Filtering (adjust if needed after looking at plots)
+MIN_FEATURES <- 300
+MAX_FEATURES <- 7000
+MAX_MT <- 25
+
+fresh_f <- subset(fresh, subset = nFeature_RNA >= MIN_FEATURES & nFeature_RNA <= MAX_FEATURES & percent.mt <= MAX_MT)
+grown_f <- subset(grown, subset = nFeature_RNA >= MIN_FEATURES & nFeature_RNA <= MAX_FEATURES & percent.mt <= MAX_MT)
+
+cat("\nCells kept:\n")
+print(c(fresh_before=ncol(fresh), fresh_after=ncol(fresh_f),
+        grown_before=ncol(grown), grown_after=ncol(grown_f)))
+
+########################
+# 5) Integration (SCT) + clustering + UMAP
+########################
+objs <- list(fresh=fresh_f, grown=grown_f)
+objs <- lapply(objs, function(x) SCTransform(x, vars.to.regress="percent.mt", verbose=FALSE))
+
+features <- SelectIntegrationFeatures(objs, nfeatures=3000)
+objs <- PrepSCTIntegration(objs, anchor.features=features, verbose=FALSE)
+anchors <- FindIntegrationAnchors(objs, normalization.method="SCT", anchor.features=features, verbose=FALSE)
+combined <- IntegrateData(anchors, normalization.method="SCT", verbose=FALSE)
+
+DefaultAssay(combined) <- "integrated"
+combined <- RunPCA(combined, npcs=40, verbose=FALSE)
+combined <- FindNeighbors(combined, dims=1:30, verbose=FALSE)
+combined <- FindClusters(combined, resolution=0.6, verbose=FALSE)
+combined <- RunUMAP(combined, dims=1:30, verbose=FALSE)
+
+# UMAPs
+p_umap_cond <- DimPlot(combined, group.by="condition") + theme_pub() + ggtitle("UMAP: Fresh vs Grown")
+p_umap_clu  <- DimPlot(combined, label=TRUE, repel=TRUE) + theme_pub() + ggtitle("UMAP: Clusters")
+p_umap_split <- DimPlot(combined, split.by="condition") + theme_pub() + ggtitle("UMAP split by condition")
+
+print(p_umap_cond); print(p_umap_clu); print(p_umap_split)
+ggsave2("UMAP_condition.png", p_umap_cond, w=8, h=6)
+ggsave2("UMAP_clusters.png",  p_umap_clu,  w=9, h=6)
+ggsave2("UMAP_split_condition.png", p_umap_split, w=12, h=6)
+
+########################
+# 6) Cluster composition by condition (barplots)
+########################
+meta <- combined@meta.data
+meta$cluster <- as.character(Idents(combined))
+
+comp <- meta %>%
+  count(condition, cluster) %>%
+  group_by(condition) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+p_comp1 <- ggplot(comp, aes(x=cluster, y=prop, fill=condition)) +
+  geom_col(position="dodge") +
+  scale_y_continuous(labels=scales::percent_format(accuracy=1)) +
+  theme_pub() +
+  ggtitle("Cluster composition by condition") +
+  xlab("Cluster") + ylab("Proportion within condition")
+print(p_comp1)
+ggsave2("Composition_cluster_by_condition.png", p_comp1, w=10, h=5)
+
+p_comp2 <- ggplot(comp, aes(x=condition, y=prop, fill=cluster)) +
+  geom_col() +
+  scale_y_continuous(labels=scales::percent_format(accuracy=1)) +
+  theme_pub() +
+  ggtitle("Condition composition by clusters (stacked)") +
+  xlab("Condition") + ylab("Proportion")
+print(p_comp2)
+ggsave2("Composition_condition_stacked.png", p_comp2, w=7, h=5)
+
+########################
+# 7) Marker discovery: top genes per cluster + heatmap + dotplot
+########################
+DefaultAssay(combined) <- "RNA"
+combined <- NormalizeData(combined, verbose=FALSE)
+combined <- FindVariableFeatures(combined, verbose=FALSE)
+
+# For marker detection, use RNA assay; Seurat recommends scaling for some visuals
+combined <- ScaleData(combined, verbose=FALSE)
+
+markers <- FindAllMarkers(
+  combined,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+fwrite(markers, file.path(DATA_DIR, "GSE211644_cluster_markers.csv"))
+
+# Top 10 per cluster
+top10 <- markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+fwrite(top10, file.path(DATA_DIR, "GSE211644_cluster_top10_markers.csv"))
+
+cat("\nTop markers per cluster (preview):\n")
+print(top10 %>% group_by(cluster) %>% summarise(top_genes = paste(head(gene,5), collapse=", ")))
+
+# Heatmap of top markers
+top_genes_all <- unique(top10$gene)
+top_genes_all <- top_genes_all[top_genes_all %in% rownames(combined)]
+
+p_hm <- DoHeatmap(combined, features=top_genes_all, size=3) + ggtitle("Top markers per cluster") + theme_pub()
+print(p_hm)
+ggsave2("Heatmap_top_markers.png", p_hm, w=12, h=10)
+
+# DotPlot for canonical T-cell markers across clusters
+canon <- c("TRAC","CD3D","CD3E","CD4","IL7R","CCR7","CD8A","CD8B",
+           "FOXP3","IL2RA","NKG7","GNLY","PRF1","GZMB","GZMK",
+           "PDCD1","CTLA4","LAG3","TIGIT","HAVCR2","TOX","CXCL13",
+           "MKI67","TOP2A")
+canon <- canon[canon %in% rownames(combined)]
+
+p_dot <- DotPlot(combined, features=canon) +
+  RotatedAxis() + theme_pub() + ggtitle("Canonical marker DotPlot (clusters)")
+print(p_dot)
+ggsave2("DotPlot_canonical_markers.png", p_dot, w=12, h=6)
+
+# Violin plots for key genes by condition
+p_vln <- VlnPlot(combined, features=c("PDCD1","TOX","CXCL13","GZMB","MKI67")[c("PDCD1","TOX","CXCL13","GZMB","MKI67") %in% rownames(combined)],
+                 group.by="condition", pt.size=0.1, ncol=3) +
+  plot_annotation(title="Key genes by condition") & theme_pub()
+print(p_vln)
+ggsave2("Violin_key_genes_by_condition.png", p_vln, w=12, h=7)
+
+########################
+# 8) Functional program scoring + beautiful plots
+########################
+exhaust <- c("PDCD1","CTLA4","LAG3","TIGIT","HAVCR2","TOX","CXCL13","ENTPD1")
+cyto    <- c("NKG7","GNLY","PRF1","GZMB","GZMK","IFNG","TNF")
+prolif  <- c("MKI67","TOP2A","TYMS","HMGB2")
+
+exhaust <- exhaust[exhaust %in% rownames(combined)]
+cyto    <- cyto[cyto %in% rownames(combined)]
+prolif  <- prolif[prolif %in% rownames(combined)]
+
+combined <- AddModuleScore(combined, features=list(exhaust), name="ExhaustScore")
+combined <- AddModuleScore(combined, features=list(cyto),    name="CytoScore")
+combined <- AddModuleScore(combined, features=list(prolif),  name="ProlifScore")
+
+# FeaturePlots
+p_scores_umap <- FeaturePlot(combined, features=c("ExhaustScore1","CytoScore1","ProlifScore1"), ncol=3) +
+  plot_annotation(title="Program scores on UMAP") & theme_pub()
+print(p_scores_umap)
+ggsave2("UMAP_program_scores.png", p_scores_umap, w=14, h=5)
+
+# Violin scores by condition
+df_scores <- combined@meta.data %>%
+  mutate(cluster=as.character(Idents(combined))) %>%
+  select(condition, cluster, ExhaustScore1, CytoScore1, ProlifScore1)
+
+p_score_violin <- ggplot(df_scores %>% tidyr::pivot_longer(cols=c(ExhaustScore1,CytoScore1,ProlifScore1),
+                                                          names_to="score", values_to="value"),
+                         aes(x=condition, y=value, fill=condition)) +
+  geom_violin(trim=TRUE, alpha=0.8) +
+  geom_boxplot(width=0.12, outlier.size=0.3, alpha=0.6) +
+  facet_wrap(~score, scales="free_y", nrow=1) +
+  theme_pub() +
+  ggtitle("Program scores by condition") +
+  xlab("") + ylab("Module score")
+print(p_score_violin)
+ggsave2("Violin_program_scores_by_condition.png", p_score_violin, w=12, h=4)
+
+# Ridge plots of Exhaustion score by condition (nice)
+p_ridge <- ggplot(df_scores, aes(x=ExhaustScore1, y=condition, fill=condition)) +
+  ggridges::geom_density_ridges(scale=1.2, alpha=0.8) +
+  theme_pub() +
+  ggtitle("Exhaustion score distribution (ridge)")
+print(p_ridge)
+ggsave2("Ridge_exhaustion_by_condition.png", p_ridge, w=8, h=4)
+
+########################
+# 9) Differential expression + volcano plots (grown vs fresh; high vs low exhaustion)
+########################
+volcano_plot <- function(de_df, title){
+  de_df <- de_df %>% mutate(gene=rownames(de_df),
+                            neglog10 = -log10(p_val_adj + 1e-300),
+                            sig = (p_val_adj < 0.05 & abs(avg_log2FC) > 0.5))
+  ggplot(de_df, aes(x=avg_log2FC, y=neglog10)) +
+    geom_point(aes(alpha=sig), size=1) +
+    geom_vline(xintercept=c(-0.5,0.5), linetype="dashed") +
+    geom_hline(yintercept=-log10(0.05), linetype="dashed") +
+    scale_alpha_manual(values=c(0.25, 0.9)) +
+    theme_pub() +
+    ggtitle(title) +
+    xlab("avg_log2FC") + ylab("-log10(adj p)")
+}
+
+# A) grown vs fresh
+Idents(combined) <- "condition"
+de_gvf <- FindMarkers(combined, ident.1="grown", ident.2="fresh", min.pct=0.1, logfc.threshold=0.25)
+de_gvf <- as.data.frame(de_gvf)
+fwrite(cbind(gene=rownames(de_gvf), de_gvf), file.path(DATA_DIR,"GSE211644_DE_grown_vs_fresh.csv"))
+
+p_vol_gvf <- volcano_plot(de_gvf, "Volcano: grown vs fresh")
+print(p_vol_gvf)
+ggsave2("Volcano_grown_vs_fresh.png", p_vol_gvf, w=8, h=5)
+
+# Show top DE genes tables (printed in HTML)
+cat("\nTop grown vs fresh (by adj p):\n")
+print(head(de_gvf[order(de_gvf$p_val_adj), ], 20))
+
+# B) high vs low exhaustion (extremes)
+hi <- quantile(combined$ExhaustScore1, 0.80, na.rm=TRUE)
+lo <- quantile(combined$ExhaustScore1, 0.20, na.rm=TRUE)
+combined$ExhGroup <- ifelse(combined$ExhaustScore1 >= hi, "High",
+                           ifelse(combined$ExhaustScore1 <= lo, "Low", "Mid"))
+Idents(combined) <- "ExhGroup"
+de_exh <- FindMarkers(combined, ident.1="High", ident.2="Low", min.pct=0.1, logfc.threshold=0.25)
+de_exh <- as.data.frame(de_exh)
+fwrite(cbind(gene=rownames(de_exh), de_exh), file.path(DATA_DIR,"GSE211644_DE_high_vs_low_exhaustion.csv"))
+
+p_vol_exh <- volcano_plot(de_exh, "Volcano: High vs Low exhaustion")
+print(p_vol_exh)
+ggsave2("Volcano_high_vs_low_exhaustion.png", p_vol_exh, w=8, h=5)
+
+cat("\nTop High vs Low exhaustion (by adj p):\n")
+print(head(de_exh[order(de_exh$p_val_adj), ], 20))
+
+########################
+# 10) Cluster annotation helper (optional quick labels based on markers)
+#     This is NOT perfect annotation, but it gives you a fast map.
+########################
+# Compute average expression for canonical markers and print a compact summary.
+Idents(combined) <- "seurat_clusters"
+avg <- AverageExpression(combined, assays="RNA", features=canon)$RNA
+avg <- as.data.frame(avg)
+avg$gene <- rownames(avg)
+
+# Pick a few "signature" genes to inspect across clusters
+sig_genes <- c("IL7R","CCR7","CD8A","GZMB","GZMK","FOXP3","PDCD1","CXCL13","MKI67","NKG7")
+sig_genes <- sig_genes[sig_genes %in% rownames(combined)]
+avg_sig <- avg[avg$gene %in% sig_genes, , drop=FALSE]
+cat("\nAverage expression (selected signatures) across clusters:\n")
+print(avg_sig)
+
+########################
+# 11) Save final objects + metadata
+########################
+saveRDS(combined, file.path(DATA_DIR,"GSE211644_combined_seurat.rds"))
+fwrite(combined@meta.data, file.path(DATA_DIR,"GSE211644_metadata_allcells.csv"))
+
+cat("\nFINISHED. Figures saved in:\n", FIG_DIR, "\n")
+cat("Main object saved:\n", file.path(DATA_DIR,"GSE211644_combined_seurat.rds"), "\n")
+print(combined)
+
+############################################################
+# END
+############################################################
