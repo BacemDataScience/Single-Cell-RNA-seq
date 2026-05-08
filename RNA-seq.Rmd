@@ -13,8 +13,6 @@ output:
 ############################################################
 # GSE211644 — ONE BIG CHUNK, MANY ANALYSES + BEAUTIFUL FIGURES
 # Author: Bacem Saada
-#
-# DATA FOLDER (your exact):
 #   D:/scRNAseq/GSE211644/
 #
 # REQUIRED FILES (8):
